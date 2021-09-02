@@ -1,0 +1,146 @@
+package main
+
+/**
+ * @Author: WeiBingtao/13156050650@163.com
+ * @Version: 1.0
+ * @Description:
+ * @Date: 2021/7/20 下午7:07
+ */
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"github.com/hyperledger/fabric/bccsp"
+	"github.com/hyperledger/fabric/bccsp/cncc"
+	"github.com/hyperledger/fabric/bccsp/factory"
+	"github.com/hyperledger/fabric/bccsp/verifier"
+	"github.com/pkg/errors"
+	"github.com/prometheus/common/log"
+	"github.com/thedevsaddam/gojsonq"
+	x509 "github.com/tjfoc/gmsm/sm2"
+	tls "github.com/tjfoc/gmtls"
+	"io/ioutil"
+	http "net/http1"
+	"unsafe"
+)
+var csp bccsp.BCCSP
+var ver *verifier.BccspCryptoVerifier
+var certBytes []byte
+
+/**
+  请求/响应数据、签名值、证书  结构体
+*/
+type Envelope struct {
+	Data        []byte `json:"data,omitempty"`        // 请求/响应数据
+	Sig         []byte `json:"sig,omitempty"`         // 签名值
+	Certificate []byte `json:"certificate,omitempty"` // 证书
+}
+
+func main() {
+	rootPEM, err := ioutil.ReadFile("/opt/go-projects/tls-server-rest/cert/tlsca")
+	if err != nil {
+		fmt.Println(err.Error())
+	}
+	roots := x509.NewCertPool()
+	ok := roots.AppendCertsFromPEM(rootPEM)
+	if !ok {
+		panic("failed to parse root certificate")
+	}
+	
+	
+	opts := factory.GetDefaultOpts()
+	opts.CNCC_GMOpts.Ip = "47.95.204.66"
+	opts.CNCC_GMOpts.Port = "34997"
+	opts.CNCC_GMOpts.Password = "123456"
+	opts.CNCC_GMOpts.NetWorkId = "1"
+	csp, err := (&factory.CNCC_GMFactory{}).Get(opts)
+	factory.SetBCCSP("CNCC_GM",csp)
+	csp, err = factory.GetBCCSP("CNCC_GM")
+	if err != nil {
+		fmt.Println(err.Error())
+	}
+	ver, err = verifier.New(csp, nil)
+	
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: roots, Verifier: ver},
+	}
+	
+	client := &http.Client{Transport: tr}
+	
+	song := make(map[string]interface{})
+	
+	song["certDn"] = "CN=CNCC"
+	song["cover"] = true
+	song["port"] =34997
+	
+	bytesData, _ := json.Marshal(song)
+	sig, err := sign(bytesData)
+	if err != nil {
+		log.Errorf("sign error :%s", err.Error())
+	}
+	
+	envelope := Envelope{
+		Data:        bytesData,
+		Sig:         sig,
+		Certificate: certBytes,
+	}
+	marshalBytes, err := json.Marshal(envelope)
+	verify, err := verify(envelope.Sig, envelope.Data, resEnvelope.Certificate)
+	res, err := client.Post("https://127.0.0.1:9443/invoke",
+		"application/json;charset=utf-8", bytes.NewBuffer(marshalBytes)
+	if err != nil {
+		fmt.Println("Fatal error ", err.Error())
+	}
+	
+	defer res.Body.Close()
+	
+	content, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		fmt.Println("Fatal error ", err.Error())
+	}
+	
+	str := (*string)(unsafe.Pointer(&content)) //转化为string,优化内存
+	p10 := gojsonq.New().FromString(*str).Find("data")
+	fmt.Println(p10.(string))
+}
+
+/**
+  签名
+*/
+func sign(data []byte) ([]byte, error) {
+	hash, err := csp.Hash(data, &bccsp.SHA256Opts{})
+	if err != nil {
+		return nil, errors.WithMessagef(err, "计算哈希失败, data = %s ", base64.StdEncoding.EncodeToString(data))
+	}
+	cert, err := x509.ReadCertificateFromMem(certBytes)
+	if err != nil {
+		return nil, errors.WithMessagef(err, "解析签名证书失败, cert = %s", string(certBytes))
+	}
+	signatrure, err := ver.Sign(cert.SubjectKeyId, hash)
+	if err != nil {
+		return nil, errors.WithMessagef(err, "签名失败, KeyLabel = %s, hash = %s",
+			cncc.KeyPrefix+string(cert.SubjectKeyId), base64.StdEncoding.EncodeToString(hash))
+	}
+	return signatrure, nil
+}
+
+/**
+  验签
+*/
+func verify(sig, data, certificate []byte) (bool, error) {
+	hash, err := csp.Hash(data, &bccsp.SHA256Opts{})
+	if err != nil {
+		return false, errors.WithMessagef(err, "计算哈希失败, data = %s ", base64.StdEncoding.EncodeToString(data))
+	}
+	cert, err := x509.ReadCertificateFromMem(certificate)
+	if err != nil {
+		return false, errors.WithMessagef(err, "解析签名证书失败, cert = %s", string(certificate))
+	}
+	result, err := ver.Verify(cert.SubjectKeyId, sig, hash)
+	if err != nil {
+		return false, errors.WithMessagef(err, "签名失败, KeyLabel = %s, hash = %s",
+			cncc.KeyPrefix+string(cert.SubjectKeyId), base64.StdEncoding.EncodeToString(hash))
+	}
+	return result, nil
+}
